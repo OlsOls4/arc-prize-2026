@@ -1,0 +1,1323 @@
+%%writefile /kaggle/surprise-gate.patch
+diff --git a/ARC3-Inference/inference/agent/python_tool_sandbox.py b/ARC3-Inference/inference/agent/python_tool_sandbox.py
+index 58a94b3..2e7df53 100644
+--- a/ARC3-Inference/inference/agent/python_tool_sandbox.py
++++ b/ARC3-Inference/inference/agent/python_tool_sandbox.py
+@@ -1,4 +1,6 @@
+ """Lightweight isolated runner for analyzer Python tool calls."""
++# Modified (Oct 2026) to add the opt-in ARC3_SURPRISE_GATE feature (surprise-gated
++# action batches); see inference/agent/surprise_gate.py. Off by default.
+ from __future__ import annotations
+ 
+ import inspect
+@@ -18,6 +20,7 @@ from typing import Any, Callable
+ from inference.utils import frame_diff as _frame_diff_module
+ from inference.utils import segmentation as _segmentation
+ from inference.utils import retained_functions as _retained_functions
++from inference.utils import surprise_predicates as _surprise_predicates
+ from inference.utils.grid_utils import ARC_COLOR_CHARS
+ 
+ 
+@@ -45,6 +48,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+ 
+     __RETAINED_FUNCTIONS_SOURCE__
+ 
++    __SURPRISE_PREDICATES_SOURCE__
++
+     HOST_STDOUT = sys.stdout
+ 
+     SAFE_MODULES = {
+@@ -464,6 +469,38 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+             pass
+ 
+         runtime_globals["TerminalStateActionError"] = TerminalStateActionError
++
++        # ARC3_SURPRISE_GATE. Off: `expect=` is rejected exactly as before (the
++        # parameter did not exist) and nothing below runs.
++        _gate_cfg = initial.get("surprise_gate") or {}
++        _gate_on = bool(_gate_cfg.get("enabled"))
++        _gate_timeout = float(_gate_cfg.get("predicate_timeout") or 0.5)
++
++        # Raised when a snippet acts again after one of its predictions was
++        # falsified. BaseException for the same reason as the terminal latch:
++        # `try: action(...) except Exception:` inside a loop must not swallow it.
++        class SurpriseStopError(BaseException):
++            pass
++
++        if _gate_on:
++            runtime_globals["SurpriseStopError"] = SurpriseStopError
++        _surprise_state = []
++        _in_predicate = [False]
++
++        def _run_expect(items, request):
++            index = request.get("index")
++            pred = items[index] if isinstance(index, int) and 0 <= index < len(items) else None
++            before = _frame_from_payload(request.get("before"))
++            after = _frame_from_payload(request.get("after"))
++            _in_predicate[0] = True
++            try:
++                verdict, error = eval_predicate(
++                    pred, before, after, dict(request.get("result") or {}),
++                    runtime_globals, _gate_timeout,
++                )
++            finally:
++                _in_predicate[0] = False
++            return {"verdict": verdict, "error": error}
+         # latched when an action reports a terminal result; scoped to THIS
+         # snippet because these closures are rebuilt for every execution, so
+         # no reset path can be missed and the next snippet always starts clear
+@@ -486,19 +523,42 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+             ),
+         }
+ 
+-        def action(actions):
++        def action(actions, expect=None):
++            if _in_predicate[0]:
++                raise RuntimeError("action() cannot be called inside an expect predicate.")
++            if expect is not None and not _gate_on:
++                # same text Python itself produced before the parameter existed
++                raise TypeError("main.<locals>.action() got an unexpected keyword argument 'expect'")
+             if _terminal_state:
+                 raise TerminalStateActionError(_TERMINAL_DETAIL[_terminal_state[0]])
++            if _surprise_state:
++                raise SurpriseStopError(_surprise_state[0])
+             normalized_actions = _normalize_actions(actions)
+-            _send({
++            message = {
+                 "type": "action",
+                 "actions": normalized_actions,
+                 # the solver decides precedence: a known death or a known no-op
+                 # is a sharper message than "your state may be stale", and it
+                 # carries a concrete override
+                 "stale_after": _stale_state[0] if _stale_state else None,
+-            })
++            }
++            _expect_items = []
++            if _gate_on:
++                _expect_items, _expect_note = normalize_expectations(
++                    expect, len(normalized_actions)
++                )
++                if _expect_note:
++                    print("[expect] " + _expect_note)
++                message["expect"] = [
++                    describe_predicate(item, _code_text) for item in _expect_items
++                ]
++            _send(message)
+             reply = _recv()
++            while reply.get("type") == "expect_eval":
++                # the host is mid-batch and asks for one prediction's verdict
++                _send({"type": "expect_result", "id": reply.get("id"),
++                       **_run_expect(_expect_items, reply)})
++                reply = _recv()
+             if reply.get("type") == "action_error":
+                 raise RuntimeError(str(reply.get("error", "action failed")))
+             if reply.get("type") != "action_result":
+@@ -543,6 +603,14 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+                 # into the snippet's own stdout, so a loop can see what its
+                 # call did without waiting for the next turn's opener
+                 print(_echo)
++            _surprise = action_result.get("surprise") if _gate_on else None
++            if isinstance(_surprise, dict) and _surprise.get("text"):
++                print("[surprise] " + str(_surprise["text"]))
++                if _surprise.get("latch") and not _surprise_state:
++                    _surprise_state.append(
++                        "a prediction in this snippet was falsified, so this action was "
++                        "not executed: " + str(_surprise["text"])
++                    )
+             gameplay_changed = action_result.get("gameplay_changed")
+             if gameplay_changed is True:
+                 # a real change means the snippet's beliefs are current again
+@@ -707,6 +775,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+             )
+         except (
+             KnownNoOpActionError,
++            SurpriseStopError,
+             RepeatedActionInStateError,
+             KnownDeathActionError,
+             TerminalStateActionError,
+@@ -738,6 +807,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+     "__SEGMENTATION_SOURCE__\n", inspect.getsource(_segmentation)
+ ).replace(
+     "__FRAME_DIFF_SOURCE__\n", inspect.getsource(_frame_diff_module)
++).replace(
++    "__SURPRISE_PREDICATES_SOURCE__\n", inspect.getsource(_surprise_predicates)
+ )
+ 
+ 
+@@ -813,6 +884,7 @@ def run_sandboxed_python(
+     kept_functions: list[str] | None = None,
+     retain_imports: bool = False,
+     repair_hints: bool = False,
++    surprise_gate: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
+     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
+         host_action_results: list[dict[str, Any]] = []
+@@ -847,21 +919,72 @@ def run_sandboxed_python(
+ 
+         threading.Thread(target=_stdout_reader, daemon=True).start()
+ 
+-        _send_json_line(
+-            process.stdin,
+-            {
+-                "code": code,
+-                "kept_functions": list(kept_functions or []),
+-                "persistence_enabled": kept_functions is not None,
+-                "retain_imports": retain_imports,
+-                "repair_hints": repair_hints,
+-                "animation_enabled": animation_handler is not None,
+-                "timeout_seconds": timeout_seconds,
+-                "sandbox_cwd": sandbox_dir,
+-                "state": initial_state,
+-                "color_chars": ARC_COLOR_CHARS,
+-            },
+-        )
++        # Lines read while waiting for a prediction verdict that turned out to
++        # be something else; the main loop drains these first.
++        pending_lines: list[str | None] = []
++        expect_counter = [0]
++
++        def _next_line(timeout: float) -> str | None:
++            if pending_lines:
++                return pending_lines.pop(0)
++            return stdout_queue.get(timeout=timeout)
++
++        def _expect_eval(index: int, before: dict, after: dict, result: dict) -> dict[str, Any]:
++            """Ask the sandbox to evaluate prediction `index` (ARC3_SURPRISE_GATE).
++
++            Runs while the sandbox is blocked inside action(), so the next line
++            it writes is the verdict. Any failure is an unknown verdict."""
++            expect_counter[0] += 1
++            request_id = expect_counter[0]
++            try:
++                _send_json_line(process.stdin, {
++                    "type": "expect_eval", "id": request_id, "index": index,
++                    "before": before, "after": after, "result": result,
++                })
++            except (OSError, ValueError):
++                return {"verdict": None, "error": "sandbox unavailable"}
++            wait_until = min(
++                deadline,
++                time.monotonic() + float((surprise_gate or {}).get("predicate_timeout") or 0.5) + 2.0,
++            )
++            while True:
++                left = wait_until - time.monotonic()
++                if left <= 0:
++                    return {"verdict": None, "error": "no verdict in time"}
++                try:
++                    raw = stdout_queue.get(timeout=left)
++                except queue.Empty:
++                    continue
++                if raw is None:
++                    pending_lines.append(None)
++                    return {"verdict": None, "error": "sandbox exited"}
++                try:
++                    reply = json.loads(raw)
++                except json.JSONDecodeError:
++                    pending_lines.append(raw)
++                    return {"verdict": None, "error": "invalid sandbox reply"}
++                if reply.get("type") == "expect_result":
++                    if reply.get("id") == request_id:
++                        return {"verdict": reply.get("verdict"), "error": reply.get("error")}
++                    continue  # a late reply to an earlier, timed-out request
++                pending_lines.append(raw)
++                return {"verdict": None, "error": "unexpected sandbox message"}
++
++        initial_message = {
++            "code": code,
++            "kept_functions": list(kept_functions or []),
++            "persistence_enabled": kept_functions is not None,
++            "retain_imports": retain_imports,
++            "repair_hints": repair_hints,
++            "animation_enabled": animation_handler is not None,
++            "timeout_seconds": timeout_seconds,
++            "sandbox_cwd": sandbox_dir,
++            "state": initial_state,
++            "color_chars": ARC_COLOR_CHARS,
++        }
++        if surprise_gate is not None:
++            initial_message["surprise_gate"] = dict(surprise_gate)
++        _send_json_line(process.stdin, initial_message)
+ 
+         deadline = time.monotonic() + max(1, int(timeout_seconds))
+         while True:
+@@ -876,7 +999,7 @@ def run_sandboxed_python(
+                 }
+ 
+             try:
+-                line = stdout_queue.get(timeout=remaining)
++                line = _next_line(remaining)
+             except queue.Empty:
+                 continue
+             if line is None:
+@@ -901,6 +1024,8 @@ def run_sandboxed_python(
+                 }
+ 
+             msg_type = str(message.get("type", "")).strip()
++            if msg_type == "expect_result":
++                continue  # late verdict for a prediction the host stopped waiting on
+             if msg_type == "animation":
+                 if animation_handler is None:
+                     _send_json_line(
+@@ -928,9 +1053,14 @@ def run_sandboxed_python(
+                     # the message carries more than the action list: stale_after
+                     # tells the solver a previous action in this snippet changed
+                     # nothing, which it weighs after its own guards
++                    handler_kwargs: dict[str, Any] = {"stale_after": message.get("stale_after")}
++                    if "expect" in message:
++                        # only sent when ARC3_SURPRISE_GATE is on
++                        handler_kwargs["expect"] = message.get("expect")
++                        handler_kwargs["expect_eval"] = _expect_eval
+                     action_result_payload = action_handler(
+                         list(message.get("actions") or []),
+-                        stale_after=message.get("stale_after"),
++                        **handler_kwargs,
+                     )
+                 except Exception:  # noqa: BLE001
+                     _send_json_line(
+diff --git a/ARC3-Inference/inference/agent/surprise_gate.py b/ARC3-Inference/inference/agent/surprise_gate.py
+new file mode 100644
+index 0000000..f68eae7
+--- /dev/null
++++ b/ARC3-Inference/inference/agent/surprise_gate.py
+@@ -0,0 +1,558 @@
++"""Surprise-gated action batches (host side).
++
++SPDX-License-Identifier: MIT-0  (our addition on top of the Apache-2.0 harness)
++
++Enabled with ``ARC3_SURPRISE_GATE=1`` (alias ``SURPRISE_GATE=1``). Off - the
++default - leaves the harness byte-for-byte on its baseline code paths: no
++prompt text, no extra sandbox messages, no extra step arguments.
++
++When on, the model may attach a prediction to each action it submits::
++
++    action(['UP', 'UP', 'LEFT'], expect=[
++        lambda p, n: player(n)[0] == player(p)[0] - 1,
++        lambda p, n: player(n)[0] == player(p)[0] - 1,
++        "frame_diff(p, n)['moved']",
++    ])
++
++The solver already executes a batch one action at a time (that is where
++Franzen's batch no-op stop lives). After each executed action it now asks a
++``BatchGate`` for a verdict. Model predictions are evaluated *inside the
++existing Python sandbox subprocess* (rlimits, restricted builtins, per-predicate
++SIGALRM time slice), via a callback over the sandbox's own pipe. A prediction
++that raises or times out is UNKNOWN, never a failure. At the first FALSE the
++rest of the batch is skipped (``stop_reason='surprise'``) and a compact
++surprise report - action, expected predicate, observed diff - goes back to the
++snippet and into the next turn's opener.
++
++Actions without a model prediction fall back to a default predicate
++(``ARC3_SURPRISE_GATE_DEFAULT``): ``changed`` (default) = the board interior
++changed, i.e. the same test Franzen's no-op stop uses. When
++``ARC3_BATCH_NOOP_BLOCK`` is on, a default-predicate failure is deferred to that
++guard so the model is not told the same thing twice.
++
++Aborts are capped per level (``ARC3_SURPRISE_GATE_MAX_ABORTS``, default 6;
++negative = unlimited; 0 = shadow mode: predictions are evaluated and logged
++but nothing is stopped and nothing is reported to the model).
++"""
++import json
++import logging
++import os
++import threading
++import time
++from typing import Any, Callable, Optional
++
++
++log = logging.getLogger(__name__)
++
++_TRUE = {"1", "true", "yes", "on"}
++
++PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
++
++
++# -- configuration (read at call time, like the harness's other opt-ins) ------
++def gate_enabled() -> bool:
++    for name in ("ARC3_SURPRISE_GATE", "SURPRISE_GATE"):
++        value = os.environ.get(name)
++        if value is not None and value.strip():
++            return value.strip().lower() in _TRUE
++    return False
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(str(os.environ.get(name, default)).strip())
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(str(os.environ.get(name, default)).strip())
++    except (TypeError, ValueError):
++        return default
++
++
++def max_aborts_per_level() -> int:
++    return _env_int("ARC3_SURPRISE_GATE_MAX_ABORTS", 6)
++
++
++def default_mode() -> str:
++    mode = os.environ.get("ARC3_SURPRISE_GATE_DEFAULT", "changed").strip().lower()
++    return mode if mode in {"changed", "none"} else "changed"
++
++
++def predicate_timeout_seconds() -> float:
++    return max(0.05, min(5.0, _env_float("ARC3_SURPRISE_GATE_TIMEOUT", 0.5)))
++
++
++def from_level() -> int:
++    return max(1, _env_int("ARC3_SURPRISE_GATE_FROM_LEVEL", 1))
++
++
++def prompt_enabled() -> bool:
++    return os.environ.get("ARC3_SURPRISE_GATE_PROMPT", "1").strip().lower() in _TRUE
++
++
++def shadow_mode() -> bool:
++    return max_aborts_per_level() == 0
++
++
++DEFAULT_PREDICATE_TEXT = "the board interior changes (default prediction)"
++
++
++# -- prompt -------------------------------------------------------------------
++def system_prompt_addendum() -> str:
++    if not prompt_enabled():
++        return ""
++    default_line = (
++        "Actions without a prediction are checked with a default one: the board "
++        "interior must change.\n"
++        if default_mode() == "changed" else ""
++    )
++    return (
++        "- Prediction-gated actions: `action(actions, expect=...)` takes one prediction per "
++        "action - a Python predicate on the frames before (`p`) and after (`n`) that action, "
++        "e.g. `expect=[lambda p, n: n.level == p.level, None, \"frame_diff(p, n)['moved']\"]`. "
++        "`p` and `n` have the same API as `current_frame`; a predicate with a third argument "
++        "`r` also receives that action's result dict. A single predicate applies to every "
++        "action; `None` means no prediction. Strings are one expression over `p`, `n`, `r`.\n"
++        "- The harness runs the actions one at a time and checks each prediction. At the first "
++        "prediction that returns False the remaining actions are NOT executed, the result has "
++        "`stop_reason='surprise'` and a `surprise` report (what you expected, what changed), "
++        "and any further `action(...)` call in the same snippet raises `SurpriseStopError`. "
++        "A predicate that raises or runs too long counts as unknown and never stops the batch. "
++        + default_line
++        + "- State the effect your plan relies on - which object moves where, which cells change "
++        "colour, that the level advances. Every action is an experiment: a batch continues only "
++        "while the world agrees with you.\n"
++    )
++
++
++# -- diff summary -------------------------------------------------------------
++def _grid_list(grid: Any) -> list:
++    return [list(row) for row in (grid or [])]
++
++
++def summarize_diff(before: Any, after: Any, *, border: int = 4, max_moves: int = 3) -> str:
++    """Compact, model-facing account of what one action changed."""
++    a, b = _grid_list(before), _grid_list(after)
++    if not a or not b:
++        return "no frame available"
++    if len(a) != len(b) or len(a[0]) != len(b[0]):
++        return f"frame shape changed {len(a)}x{len(a[0])} -> {len(b)}x{len(b[0])} (full redraw)"
++    rows, cols = len(a), len(a[0])
++    interior, edge = [], 0
++    transitions: dict[tuple[int, int], int] = {}
++    for r in range(rows):
++        ra, rb = a[r], b[r]
++        if ra == rb:
++            continue
++        for c in range(cols):
++            if ra[c] != rb[c]:
++                inside = border <= r < rows - border and border <= c < cols - border
++                if inside or border <= 0:
++                    interior.append((r, c))
++                    key = (ra[c], rb[c])
++                    transitions[key] = transitions.get(key, 0) + 1
++                else:
++                    edge += 1
++    if not interior and not edge:
++        return "nothing changed anywhere on the board"
++    parts = []
++    if interior:
++        r0 = min(p[0] for p in interior); r1 = max(p[0] for p in interior)
++        c0 = min(p[1] for p in interior); c1 = max(p[1] for p in interior)
++        top = sorted(transitions.items(), key=lambda kv: -kv[1])[:4]
++        parts.append(
++            f"{len(interior)} interior cell(s) changed in rows {r0}-{r1}, cols {c0}-{c1}"
++            + (" (colour " + ", ".join(f"{x}>{y} x{k}" for (x, y), k in top) + ")" if top else "")
++        )
++    else:
++        parts.append("no change inside the board area")
++    if edge:
++        parts.append(f"{edge} edge/HUD cell(s) changed")
++    moves = _object_moves(a, b, max_moves) if interior else ""
++    if moves:
++        parts.append(moves)
++    return "; ".join(parts)
++
++
++def _object_moves(a: list, b: list, max_moves: int) -> str:
++    """Object-level moves via the harness's own segmentation + frame_diff.
++    Best effort: any failure just omits the clause."""
++    try:
++        from inference.utils.frame_diff import compute_frame_diff
++        from inference.utils.grid_utils import ARC_COLOR_CHARS
++        from inference.utils.segmentation import segment_layer
++
++        nodes_a = segment_layer(a, ARC_COLOR_CHARS).get("nodes", [])
++        nodes_b = segment_layer(b, ARC_COLOR_CHARS).get("nodes", [])
++        diff = compute_frame_diff(a, b, nodes_a, nodes_b)
++    except Exception:  # noqa: BLE001
++        return ""
++    bits = []
++    for entry in (diff.get("moved") or [])[:max_moves]:
++        bits.append(f"colour {entry.get('color')} object moved {entry.get('from')}->{entry.get('to')}")
++    counts = [
++        f"{len(diff.get(k) or [])} {k}"
++        # "resized" left out: it is dominated by backgrounds and HUD bars
++        for k in ("appeared", "disappeared", "changed_color")
++        if diff.get(k)
++    ]
++    if counts:
++        bits.append(", ".join(counts))
++    return "; ".join(bits)
++
++
++# -- statistics ----------------------------------------------------------------
++def _new_level_counters() -> dict[str, Any]:
++    return {
++        "batches": 0,            # action(...) calls that executed >= 1 action
++        "actions": 0,            # executed actions
++        "requested": 0,          # submitted actions
++        "predicted": 0,          # actions carrying a model prediction
++        "model": {PASS: 0, FAIL: 0, UNKNOWN: 0},
++        "default": {PASS: 0, FAIL: 0, UNKNOWN: 0},
++        "aborts": 0,             # batches cut short by a surprise
++        "halts": 0,              # snippets latched after a surprise on a last action
++        "actions_saved": 0,      # submitted actions skipped by surprise aborts
++        "capped": 0,             # surprises that did not stop (per-level cap reached)
++        "noop_deferred": 0,      # default-predicate failures left to the no-op stop
++        "shadow_fail": 0,        # failures seen in shadow mode (cap = 0)
++    }
++
++
++class SurpriseGateStats:
++    """Per-game counters, kept per level. Thread-safe enough for one game."""
++
++    _registry: "list[SurpriseGateStats]" = []
++    _registry_lock = threading.Lock()
++
++    def __init__(self, game_id: str = "") -> None:
++        self.game_id = game_id
++        self.levels: dict[str, dict[str, Any]] = {}
++        self.level: Any = None
++        self.created = time.time()
++        with SurpriseGateStats._registry_lock:
++            SurpriseGateStats._registry.append(self)
++
++    def note_level(self, level: Any) -> dict[str, Any]:
++        key = str(level if level is not None else "?")
++        self.level = level
++        if key not in self.levels:
++            self.levels[key] = _new_level_counters()
++        return self.levels[key]
++
++    def current(self) -> dict[str, Any]:
++        return self.note_level(self.level)
++
++    def aborts_left(self) -> Optional[int]:
++        cap = max_aborts_per_level()
++        if cap < 0:
++            return None
++        used = self.current()["aborts"] + self.current()["halts"]
++        return max(0, cap - used)
++
++    def record_verdict(self, source: Optional[str], verdict: Optional[bool]) -> None:
++        if source not in ("model", "default"):
++            return
++        bucket = self.current()[source]
++        bucket[PASS if verdict is True else FAIL if verdict is False else UNKNOWN] += 1
++
++    def record_batch(self, level: Any, requested: int, executed: int, predicted: int) -> None:
++        counters = self.note_level(level)
++        counters["requested"] += max(0, int(requested))
++        counters["actions"] += max(0, int(executed))
++        counters["predicted"] += max(0, int(predicted))
++        if executed:
++            counters["batches"] += 1
++
++    def bump(self, key: str, amount: int = 1) -> None:
++        self.current()[key] += amount
++
++    # -- reporting --------------------------------------------------------------
++    def totals(self) -> dict[str, Any]:
++        return _sum_levels(self.levels.values())
++
++    def to_dict(self) -> dict[str, Any]:
++        return {"game_id": self.game_id, "levels": self.levels, "totals": with_rates(self.totals())}
++
++    def summary_line(self) -> str:
++        t = with_rates(self.totals())
++        return (
++            f"surprise_gate[{self.game_id}] actions={t['actions']} aborts={t['aborts']} "
++            f"halts={t['halts']} saved={t['actions_saved']} capped={t['capped']} "
++            f"model p/f/u={t['model'][PASS]}/{t['model'][FAIL]}/{t['model'][UNKNOWN]} "
++            f"default p/f/u={t['default'][PASS]}/{t['default'][FAIL]}/{t['default'][UNKNOWN]}"
++        )
++
++    def write(self, path: Any) -> None:
++        try:
++            with open(path, "w", encoding="utf-8") as handle:
++                json.dump(self.to_dict(), handle, indent=1)
++        except OSError:
++            log.debug("surprise gate stats not written to %s", path, exc_info=True)
++
++    @classmethod
++    def aggregate(cls) -> dict[str, Any]:
++        """Totals over every game in this process (for a notebook cell)."""
++        with cls._registry_lock:
++            games = list(cls._registry)
++        levels = [lv for g in games for lv in g.levels.values()]
++        out = with_rates(_sum_levels(levels))
++        out["games"] = len(games)
++        return out
++
++
++def summarize_run_dir(root: Any) -> dict[str, Any]:
++    """Totals over every ``surprise_gate_stats.json`` under ``root``.
++
++    Works after the fact and across processes, unlike ``aggregate()``. One
++    file per game run directory; per-game totals are included for analysis.
++    """
++    from pathlib import Path
++
++    levels, games = [], []
++    for path in sorted(Path(root).rglob("surprise_gate_stats.json")):
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except (OSError, ValueError):
++            continue
++        games.append({"game_id": data.get("game_id"), "path": str(path),
++                      "totals": data.get("totals")})
++        levels.extend((data.get("levels") or {}).values())
++    out = with_rates(_sum_levels(levels))
++    out["games"] = len(games)
++    out["per_game"] = games
++    return out
++
++
++def _sum_levels(levels: Any) -> dict[str, Any]:
++    total = _new_level_counters()
++    for counters in levels:
++        for key, value in counters.items():
++            if isinstance(value, dict):
++                for sub, n in value.items():
++                    total[key][sub] = total[key].get(sub, 0) + n
++            else:
++                total[key] += value
++    return total
++
++
++def with_rates(counters: dict[str, Any]) -> dict[str, Any]:
++    out = json.loads(json.dumps(counters))
++    for source in ("model", "default"):
++        bucket = out[source]
++        n = sum(bucket.values())
++        out[f"{source}_rates"] = {
++            k: (round(v / n, 4) if n else None) for k, v in bucket.items()
++        }
++    out["actions_saved_fraction"] = (
++        round(out["actions_saved"] / out["requested"], 4) if out["requested"] else None
++    )
++    return out
++
++
++# -- per-call gate ----------------------------------------------------------------
++Evaluator = Callable[[int, dict, dict, dict], dict]
++
++
++class BatchGate:
++    """Judges each executed action of ONE action(...) call.
++
++    Created by the tool agent, handed to the solver through the step
++    arguments, and consulted by ``_HarnessGameSession.step_env`` right after
++    each executed action (alongside the batch no-op stop).
++    """
++
++    def __init__(
++        self,
++        *,
++        descriptions: list,
++        stats: SurpriseGateStats,
++        evaluator: Optional[Evaluator] = None,
++        frame_payload: Optional[Callable[[Any, Any], dict]] = None,
++        border: int = 4,
++        noop_block_active: bool = False,
++    ) -> None:
++        self.descriptions = list(descriptions)
++        self.stats = stats
++        self.evaluator = evaluator
++        self.frame_payload = frame_payload or _plain_frame_payload
++        self.border = border
++        self.noop_block_active = noop_block_active
++        self.verdicts: dict[int, tuple[Optional[str], Optional[bool]]] = {}
++        self.surprises: list[dict[str, Any]] = []
++        self.latch = False
++        self.aborted = False
++        self.start_level: Any = None
++
++    def predicted_count(self, upto: Optional[int] = None) -> int:
++        items = self.descriptions if upto is None else self.descriptions[:upto]
++        return sum(1 for d in items if d is not None)
++
++    def check(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
++        """Fail-open wrapper: a bug in the gate must never cost the game an
++        action or crash step_env. See ``_check`` for the contract."""
++        try:
++            return self._check(*args, **kwargs)
++        except Exception:  # noqa: BLE001
++            log.warning("surprise gate check failed; continuing ungated", exc_info=True)
++            return {"abort": False, "defer_noop": False}
++
++    def _check(
++        self,
++        index: int,
++        batch_size: int,
++        before_grid: Any,
++        after_grid: Any,
++        payload: dict,
++        *,
++        before_level: Any = None,
++        terminal: bool = False,
++    ) -> dict[str, Any]:
++        """``index`` is 1-based. Returns ``{"abort": bool, "defer_noop": bool}``.
++
++        ``terminal`` marks an action that ended the attempt, the level or the
++        run: the solver stops the batch there anyway, so its prediction is only
++        scored (for the counters), never reported or latched.
++        """
++        level = before_level if before_level is not None else payload.get("level")
++        if self.start_level is None:
++            self.start_level = level
++        self.stats.note_level(level)
++        try:
++            if int(level) < from_level():
++                return {"abort": False, "defer_noop": False}
++        except (TypeError, ValueError):
++            pass
++        desc = self.descriptions[index - 1] if 0 < index <= len(self.descriptions) else None
++        verdict: Optional[bool] = None
++        source: Optional[str] = None
++        error = ""
++        if desc is not None and self.evaluator is not None:
++            source = "model"
++            try:
++                reply = self.evaluator(
++                    index - 1,
++                    self.frame_payload(before_grid, payload, before=True, level=level),
++                    self.frame_payload(after_grid, payload, before=False,
++                                       level=payload.get("level")),
++                    _per_action_result(payload),
++                ) or {}
++            except Exception as exc:  # noqa: BLE001 - a broken channel is an unknown
++                reply = {"verdict": None, "error": f"{type(exc).__name__}: {exc}"}
++            verdict = reply.get("verdict") if reply.get("verdict") in (True, False) else None
++            error = str(reply.get("error") or "")
++        elif desc is None and default_mode() == "changed":
++            source = "default"
++            desc = DEFAULT_PREDICATE_TEXT
++            changed = payload.get("gameplay_changed")
++            verdict = changed if changed in (True, False) else None
++        self.verdicts[index] = (source, verdict)
++        self.stats.record_verdict(source, verdict)
++        if verdict is not False or terminal:
++            return {"abort": False, "defer_noop": False}
++
++        remaining = max(0, batch_size - index)
++        if source == "default":
++            if remaining == 0:
++                return {"abort": False, "defer_noop": False}
++            if self.noop_block_active:
++                self.stats.bump("noop_deferred")
++                return {"abort": False, "defer_noop": True}
++        if shadow_mode():
++            self.stats.bump("shadow_fail")
++            return {"abort": False, "defer_noop": False}
++
++        surprise = {
++            "index": index,
++            "of": batch_size,
++            "action": payload.get("action_display") or payload.get("action_name"),
++            "expected": desc,
++            "source": source,
++            "observed": summarize_diff(before_grid, after_grid, border=self.border),
++        }
++        if error:
++            surprise["error"] = error
++        left = self.stats.aborts_left()
++        if left is not None and left <= 0:
++            surprise["capped"] = True
++            self.stats.bump("capped")
++            self.surprises.append(surprise)
++            return {"abort": False, "defer_noop": False}
++        if remaining > 0:
++            self.stats.bump("aborts")
++            self.stats.bump("actions_saved", remaining)
++            self.aborted = True
++            surprise["skipped"] = remaining
++        else:
++            self.stats.bump("halts")
++        if source == "model":
++            self.latch = True
++        self.surprises.append(surprise)
++        return {"abort": remaining > 0, "defer_noop": False}
++
++    # -- rendering -----------------------------------------------------------------
++    def trace_suffix(self, index: int) -> str:
++        source, verdict = self.verdicts.get(index, (None, None))
++        if source is None or (source == "default" and verdict is not False):
++            return ""  # a held default prediction is the common case: say nothing
++        word = {True: "held", False: "FAILED", None: "unknown"}[verdict]
++        return f" | prediction {word}" + (" (default)" if source == "default" else "")
++
++    def report(self, skipped_displays: Optional[list] = None) -> Optional[dict[str, Any]]:
++        if not self.surprises:
++            return None
++        return {
++            "surprises": self.surprises,
++            "latch": self.latch,
++            "text": render_report(self.surprises, skipped_displays or [], latch=self.latch),
++        }
++
++
++def render_report(surprises: list, skipped: list, *, latch: bool) -> str:
++    lines = []
++    for s in surprises[:3]:
++        line = (
++            f"SURPRISE at action {s.get('index')} of {s.get('of')} ({s.get('action')!r}): "
++            f"expected `{s.get('expected')}`, observed: {s.get('observed')}."
++        )
++        if s.get("capped"):
++            line += " (Surprise limit for this level reached, so the batch was NOT stopped.)"
++        elif s.get("skipped"):
++            line += f" The remaining {s['skipped']} action(s) {skipped!r} were NOT executed."
++        lines.append(line)
++    if latch:
++        lines.append(
++            "Your model of the game was wrong about this action: re-locate objects from "
++            "current_frame and re-plan. Further action(...) calls in this snippet raise "
++            "SurpriseStopError."
++        )
++    return " ".join(lines)
++
++
++def _per_action_result(payload: dict) -> dict:
++    keys = (
++        "action_num", "level", "score", "state", "board_changed", "gameplay_changed",
++        "no_op", "done", "level_completed", "game_over", "run_complete",
++        "action_name", "action_data", "action_display", "batch_index", "batch_size",
++    )
++    return {k: payload[k] for k in keys if k in payload}
++
++
++def _plain_frame_payload(grid: Any, payload: dict, *, before: bool, level: Any = None) -> dict:
++    """Frame payload in the sandbox's FrameView wire format."""
++    from inference.utils.grid_utils import format_grid_ascii
++
++    rows = [list(row) for row in (grid or [])]
++    if level is None:
++        level = payload.get("level", 0)
++    step = int(payload.get("action_num", 0) or 0) - (1 if before else 0)
++    return {
++        "ascii": format_grid_ascii(tuple(tuple(r) for r in rows)),
++        "step": max(0, step),
++        "level": int(level) if isinstance(level, int) else 0,
++        "shape": [len(rows), len(rows[0]) if rows else 0],
++        "grid": rows,
++    }
+diff --git a/ARC3-Inference/inference/agent/tool_agent.py b/ARC3-Inference/inference/agent/tool_agent.py
+index 84a9cdd..e435649 100644
+--- a/ARC3-Inference/inference/agent/tool_agent.py
++++ b/ARC3-Inference/inference/agent/tool_agent.py
+@@ -1,4 +1,6 @@
+ """Direct OpenAI-compatible tool-calling analyzer for ARC puzzle runs."""
++# Modified (Oct 2026) to add the opt-in ARC3_SURPRISE_GATE feature (surprise-gated
++# action batches); see inference/agent/surprise_gate.py. Off by default.
+ from __future__ import annotations
+ 
+ import base64
+@@ -19,6 +21,7 @@ from urllib.parse import urlparse, urlunparse
+ import requests
+ 
+ from inference.agent.noop_repeat_guard import NoopRepeatGuard, action_signature
++from inference.agent import surprise_gate
+ from inference.agent.priority_scheduler import (
+     ProgressPace, PrioritySnapshot, parse_total_levels, priority_value,
+ )
+@@ -2717,6 +2720,11 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
+     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
+         # General checks during action sequences and targeted probes when search fails.
+         prompt += STEP_VERIFICATION_ADDENDUM
++    if surprise_gate.gate_enabled():
++        # ARC3_SURPRISE_GATE: documents action(..., expect=...). Unlike the
++        # guards below this needs describing up front - the model has to choose
++        # to write predictions before any refusal could teach it.
++        prompt += surprise_gate.system_prompt_addendum()
+     # only describe the guards that are actually armed: prompt weight spent on a
+     # mechanism that cannot fire is weight the model reads and cannot use, and an
+     # exception it is told about but never sees is worse than silence
+@@ -3555,6 +3563,8 @@ class ToolAgent:
+         self._noop_guard_deaths_enabled: bool = _get_env_bool(
+             "ARC3_DEATH_REPEAT_GUARD", False
+         )
++        # ARC3_SURPRISE_GATE counters for this game; created on first use.
++        self._surprise_stats: surprise_gate.SurpriseGateStats | None = None
+         self._noop_repeat_guard: NoopRepeatGuard | None = (
+             NoopRepeatGuard()
+             if (
+@@ -3780,6 +3790,12 @@ class ToolAgent:
+                 for item in executed_results
+                 if item.get("stop_reason") == "no_op_action"
+             ],
++            # ARC3_SURPRISE_GATE reports; always empty when the gate is off
++            "surprise_reports": [
++                str(item["surprise"].get("text") or "")
++                for item in executed_results
++                if isinstance(item.get("surprise"), dict) and item["surprise"].get("text")
++            ],
+             # the animation of the last executed action, which is what
+             # last_animation_frames / last_animation_timeline will return when asked
+             "animation": (executed_results[-1].get("animation") if executed_results else None),
+@@ -4791,6 +4807,8 @@ class ToolAgent:
+                 f"The sequence was stopped before {stop.get('action')!r}: "
+                 f"{stop.get('reason', 'a guard refused it')}."
+             )
++        for text in (summary.get("surprise_reports") or [])[:3]:
++            lines.append(text)
+         if summary.get("level_completed"):
+             lines.append("You have progressed to a new level!")
+         elif summary.get("game_over"):
+@@ -4952,6 +4970,15 @@ class ToolAgent:
+                 lines.append(
+                     f"({len(guard_stops) - 3} further guard stop(s) occurred this sequence.)"
+                 )
++            surprise_reports = previous_step_summary.get("surprise_reports") or []
++            for text in surprise_reports[:3]:
++                # ARC3_SURPRISE_GATE: the falsified prediction, carried into the
++                # turn that has to replace the plan built on it
++                lines.append("Note: " + text)
++            if len(surprise_reports) > 3:
++                lines.append(
++                    f"({len(surprise_reports) - 3} further surprise report(s) this sequence.)"
++                )
+             if previous_step_summary.get("run_complete"):
+                 lines.append("You have completed the run!")
+             elif previous_step_summary.get("level_transition"):
+@@ -5692,7 +5719,7 @@ class ToolAgent:
+             compact["stopped_early"] = bool(payload.get("stopped_early"))
+         # blocked_action names the refused action for the next turn's opener;
+         # without it the model was told "the sequence was stopped before None"
+-        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation"):
++        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation", "surprise"):
+             if passthrough_key in payload:
+                 compact[passthrough_key] = payload.get(passthrough_key)
+         if payload.get("stop_reason"):
+@@ -5714,6 +5741,37 @@ class ToolAgent:
+             compact["error"] = payload.get("error")
+         return compact
+ 
++    def _surprise_stats_for(self, state_path: Path) -> "surprise_gate.SurpriseGateStats":
++        # getattr: an agent restored from a pickle predating this field has none
++        if getattr(self, "_surprise_stats", None) is None:
++            self._surprise_stats = surprise_gate.SurpriseGateStats(
++                game_id=Path(state_path).parent.name
++            )
++        return self._surprise_stats
++
++    def _record_surprise_batch(
++        self,
++        state_path: Path,
++        gate: "surprise_gate.BatchGate",
++        raw_payload: dict[str, Any],
++        requested: int,
++    ) -> None:
++        """ARC3_SURPRISE_GATE bookkeeping after one action(...) call. Never raises."""
++        try:
++            stats = gate.stats
++            executed = int(raw_payload.get("executed_count") or (1 if raw_payload.get("executed") else 0))
++            stats.record_batch(
++                gate.start_level if gate.start_level is not None else raw_payload.get("level"),
++                requested,
++                executed if raw_payload.get("executed") else 0,
++                gate.predicted_count(executed),
++            )
++            if raw_payload.get("level_completed") or raw_payload.get("run_complete"):
++                log.info("%s", stats.summary_line())
++            stats.write(Path(state_path).parent / "surprise_gate_stats.json")
++        except Exception:  # noqa: BLE001 - diagnostics must not cost an action
++            log.debug("surprise gate bookkeeping failed", exc_info=True)
++
+     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
+         self._ensure_session(state_path)
+         code = str(arguments.get("code", "")).rstrip()
+@@ -5775,7 +5833,11 @@ class ToolAgent:
+             return build_animation_view(record)
+ 
+         def _handle_action(
+-            actions: list[dict[str, Any]], *, stale_after: str | None = None
++            actions: list[dict[str, Any]],
++            *,
++            stale_after: str | None = None,
++            expect: list[Any] | None = None,
++            expect_eval: Callable[..., dict[str, Any]] | None = None,
+         ) -> dict[str, Any]:
+             nonlocal terminal_action_result, snippet_executed_actions
+             if self._step_env_callback is None:
+@@ -5846,9 +5908,29 @@ class ToolAgent:
+                 # own per-position guards, which name a specific action and
+                 # carry an override
+                 step_arguments["stale_after"] = stale_after
++            batch_gate = None
++            if surprise_gate.gate_enabled():
++                stats = self._surprise_stats_for(state_path)
++                descriptions = list(expect or [])
++                descriptions = (descriptions + [None] * len(normalized_actions))[
++                    : len(normalized_actions)
++                ]
++                batch_gate = surprise_gate.BatchGate(
++                    descriptions=descriptions,
++                    stats=stats,
++                    evaluator=expect_eval,
++                    border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 4),
++                    noop_block_active=(
++                        _get_env_bool("ARC3_BATCH_NOOP_BLOCK", False)
++                        and _get_env_int("ARC3_NOOP_GUARD_BORDER", 4) > 0
++                    ),
++                )
++                step_arguments["surprise_gate"] = batch_gate
+             raw_payload = self._step_env_callback(step_arguments)
+             if not isinstance(raw_payload, dict):
+                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
++            if batch_gate is not None:
++                self._record_surprise_batch(state_path, batch_gate, raw_payload, len(normalized_actions))
+             if reset_exposed() and raw_payload.get("executed"):
+                 # Use actual execution, not submitted batch size: a refused
+                 # call does not consume the snippet's first-action allowance.
+@@ -5902,6 +5984,13 @@ class ToolAgent:
+             kept_functions=self._retained_sources(),
+             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
+             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
++            surprise_gate=(
++                {
++                    "enabled": True,
++                    "predicate_timeout": surprise_gate.predicate_timeout_seconds(),
++                }
++                if surprise_gate.gate_enabled() else None
++            ),
+         )
+ 
+         action_results = [
+diff --git a/ARC3-Inference/inference/framework/solver.py b/ARC3-Inference/inference/framework/solver.py
+index e40976c..35ebdf2 100644
+--- a/ARC3-Inference/inference/framework/solver.py
++++ b/ARC3-Inference/inference/framework/solver.py
+@@ -1,5 +1,7 @@
+ """TAAF solver adapter for the existing tool-using harness."""
+ 
++# Modified (Oct 2026) to add the opt-in ARC3_SURPRISE_GATE feature (surprise-gated
++# action batches); see inference/agent/surprise_gate.py. Off by default.
+ from __future__ import annotations
+ 
+ import asyncio
+@@ -1028,6 +1030,10 @@ class _HarnessGameSession:
+             else None
+         )
+ 
++        # ARC3_SURPRISE_GATE: a per-call BatchGate built by the tool agent. Absent
++        # (None) whenever the gate is off, which keeps this loop on its baseline path.
++        surprise_gate = arguments.get("surprise_gate")
++
+         for batch_index, action in enumerate(requested_actions, start=1):
+             if self.should_stop():
+                 stop_reason = "stopped"
+@@ -1100,6 +1106,9 @@ class _HarnessGameSession:
+                     break
+                 return self._error_payload(message)
+ 
++            if surprise_gate is not None:
++                gate_before_grid = _grid_from_state(self.game.current_state)
++                gate_before_level = _level_number(self.game)
+             try:
+                 payload = self._execute_action(
+                     action,
+@@ -1115,6 +1124,24 @@ class _HarnessGameSession:
+             executed_payloads.append(payload)
+             total_reward += float(payload.get("reward", 0.0) or 0.0)
+ 
++            gate_verdict = None
++            if surprise_gate is not None:
++                # Judged before the terminal stops below so terminal actions are
++                # still scored; the gate never stops or reports those itself.
++                gate_verdict = surprise_gate.check(
++                    batch_index,
++                    batch_size,
++                    gate_before_grid,
++                    _grid_from_state(self.game.current_state),
++                    payload,
++                    before_level=gate_before_level,
++                    terminal=bool(
++                        payload.get("run_complete")
++                        or payload.get("game_over")
++                        or payload.get("level_completed")
++                    ),
++                )
++
+             if payload.get("run_complete"):
+                 stop_reason = "run_complete"
+                 break
+@@ -1124,6 +1151,11 @@ class _HarnessGameSession:
+             if payload.get("level_completed"):
+                 stop_reason = "level_completed"
+                 break
++            if gate_verdict is not None and gate_verdict.get("abort"):
++                # A model prediction (or the default one) was falsified: the rest
++                # of the batch was planned on a world model the game just refuted.
++                stop_reason = "surprise"
++                break
+             if (
+                 BATCH_NOOP_BLOCK
+                 and NOOP_GUARD_BORDER_WIDTH > 0
+@@ -1192,6 +1224,17 @@ class _HarnessGameSession:
+                 # it in the returned dict shows the model the same line twice,
+                 # once on stdout and once in the payload it reads back
+                 final_payload["action_echo"] = echo
++        if surprise_gate is not None:
++            if final_payload.get("action_trace"):
++                final_payload["action_trace"] = [
++                    line + surprise_gate.trace_suffix(position)
++                    for position, line in enumerate(final_payload["action_trace"], 1)
++                ]
++            report = surprise_gate.report(final_payload.get("skipped_actions") or [])
++            if report is not None:
++                final_payload["surprise"] = report
++                if stop_reason == "surprise":
++                    final_payload["stop_detail"] = report["text"]
+         if blocked_detail is not None:
+             final_payload["stop_detail"] = blocked_detail
+             final_payload["blocked_action"] = requested_displays[len(executed_payloads)]
+diff --git a/ARC3-Inference/inference/utils/surprise_predicates.py b/ARC3-Inference/inference/utils/surprise_predicates.py
+new file mode 100644
+index 0000000..c64e2e6
+--- /dev/null
++++ b/ARC3-Inference/inference/utils/surprise_predicates.py
+@@ -0,0 +1,207 @@
++"""Sandbox-side helpers for surprise-gated action batches (ARC3_SURPRISE_GATE).
++
++SPDX-License-Identifier: MIT-0  (our addition on top of the Apache-2.0 harness)
++
++Like frame_diff.py and segmentation.py, this module's source is spliced
++verbatim into the sandbox bootstrap (python_tool_sandbox.py), which runs under
++``python -I -S``. It therefore has stdlib-only imports and no ``from
++__future__`` import. The host imports it too, for tests and for describing
++predicates.
++
++A *prediction* is attached to one action and judges that action's effect:
++
++* a callable ``f(p, n)`` or ``f(p, n, r)``, where ``p``/``n`` are the frame views
++  before/after the action (same API as ``current_frame``) and ``r`` is that
++  action's result dict; or
++* a string holding one Python expression over the names ``p``, ``n``, ``r``
++  (plus every global the snippet can see, e.g. ``frame_diff``).
++
++Verdicts are tri-state: True (held), False (falsified), None (unknown: the
++predicate raised, timed out, returned None, or tried to act).
++"""
++import ast
++import signal
++
++
++PREDICATE_TEXT_LIMIT = 160
++
++
++class PredicateTimeout(BaseException):
++    """Raised inside a predicate that overruns its time slice.
++
++    BaseException so a predicate's own ``except Exception`` cannot swallow it.
++    """
++
++
++def normalize_expectations(expect, count):
++    """Align ``expect`` with a batch of ``count`` actions.
++
++    Returns ``(items, note)``. A single callable/string applies to every
++    action; a list is padded with None (or truncated) to the batch length,
++    which is reported in ``note`` rather than raised: an error here would cost
++    the whole snippet before any action ran, for a bookkeeping mistake.
++    """
++    count = max(0, int(count))
++    if expect is None:
++        return [None] * count, ""
++    if callable(expect) or isinstance(expect, str):
++        return [expect] * count, ""
++    if isinstance(expect, (list, tuple)):
++        items = list(expect)
++        note = ""
++        if len(items) != count:
++            note = (
++                f"expect has {len(items)} entries for {count} actions; "
++                + ("missing entries count as no prediction." if len(items) < count
++                   else "extra entries were ignored.")
++            )
++        items = (items + [None] * count)[:count]
++        cleaned = []
++        for item in items:
++            if item is None or callable(item) or isinstance(item, str):
++                cleaned.append(item)
++            else:
++                cleaned.append(None)
++                note = (note + " " if note else "") + (
++                    "non-callable, non-string expect entries were ignored."
++                )
++        return cleaned, note
++    return [None] * count, "expect must be a callable, a string, or a list; it was ignored."
++
++
++def _shorten(text, limit=PREDICATE_TEXT_LIMIT):
++    text = " ".join(str(text or "").split())
++    return text if len(text) <= limit else text[: limit - 3] + "..."
++
++
++def describe_predicate(pred, code_text=""):
++    """Short source text for a prediction, for the surprise report.
++
++    Snippet code is exec'd from a string, so ``inspect.getsource`` cannot see
++    it. Recover the lambda / def text from the snippet source by line number.
++    """
++    if pred is None:
++        return None
++    if isinstance(pred, str):
++        return _shorten(pred)
++    code = getattr(pred, "__code__", None)
++    name = getattr(pred, "__name__", "") or "predicate"
++    if code is None or not code_text:
++        return _shorten(name)
++    line = getattr(code, "co_firstlineno", None)
++    try:
++        tree = ast.parse(code_text)
++    except SyntaxError:
++        return _shorten(name)
++    argnames = list(getattr(code, "co_varnames", ())[: getattr(code, "co_argcount", 0)])
++    matches = []
++    for node in ast.walk(tree):
++        if getattr(node, "lineno", None) != line:
++            continue
++        if isinstance(node, ast.FunctionDef) and node.name == name:
++            matches.append(node)
++        elif isinstance(node, ast.Lambda) and name == "<lambda>":
++            if [a.arg for a in node.args.args] == argnames:
++                matches.append(node)
++    if not matches:
++        return _shorten(name) + _closure_text(pred)
++    # several candidates on one line (e.g. a lambda returning a lambda): the
++    # innermost one is the function object we were handed
++    node = min(matches, key=lambda m: (getattr(m, "end_col_offset", 0) or 0) - m.col_offset)
++    if isinstance(node, ast.FunctionDef):
++        body = node.body[-1] if node.body else None
++        if isinstance(body, ast.Return) and body.value is not None:
++            segment = ast.get_source_segment(code_text, body.value)
++            if segment:
++                return _shorten(f"{node.name}: {segment}" + _closure_text(pred))
++        return _shorten(f"def {node.name}(...) at line {line}" + _closure_text(pred))
++    segment = ast.get_source_segment(code_text, node) or f"{name} at line {line}"
++    return _shorten(segment + _closure_text(pred))
++
++
++def _closure_text(fn):
++    """Simple captured values, so `step(0, 1)` reads as `... [dr=0, dc=1]`."""
++    code = getattr(fn, "__code__", None)
++    cells = getattr(fn, "__closure__", None) or ()
++    if code is None or not cells:
++        return ""
++    bits = []
++    for var, cell in zip(code.co_freevars, cells):
++        try:
++            value = cell.cell_contents
++        except ValueError:
++            continue
++        if isinstance(value, (int, float, str, bool, tuple)) and len(repr(value)) <= 24:
++            bits.append(f"{var}={value!r}")
++    return f" [{', '.join(bits)}]" if bits else ""
++
++
++def _call_with_arity(fn, p, n, r):
++    code = getattr(fn, "__code__", None)
++    argcount = getattr(code, "co_argcount", 2) if code is not None else 2
++    if code is not None and getattr(fn, "__self__", None) is not None:
++        argcount -= 1  # bound method
++    if argcount >= 3:
++        return fn(p, n, r)
++    if argcount == 1:
++        return fn(n)
++    return fn(p, n)
++
++
++def _timeout_handler(signum, frame):
++    raise PredicateTimeout()
++
++
++def eval_predicate(pred, p, n, r, globals_dict=None, timeout_seconds=0.5):
++    """Evaluate one prediction. Returns ``(verdict, error_text)``.
++
++    ``verdict`` is True / False / None. Never raises (except for interpreter
++    shutdown signals): any failure is an unknown, not a falsification.
++    The time limit uses SIGALRM, so it applies only on the main thread - which
++    is where the sandbox runs snippets. Off the main thread it runs unlimited
++    (the host-side tool deadline still bounds the whole snippet).
++    """
++    try:
++        return _eval_predicate(pred, p, n, r, globals_dict, timeout_seconds)
++    except PredicateTimeout:  # alarm landed between return and disarm
++        return None, f"timed out after {timeout_seconds}s"
++
++
++def _eval_predicate(pred, p, n, r, globals_dict, timeout_seconds):
++    if pred is None:
++        return None, "no prediction"
++    previous_handler = None
++    armed = False
++    try:
++        if timeout_seconds and timeout_seconds > 0 and hasattr(signal, "setitimer"):
++            try:
++                previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
++                signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
++                armed = True
++            except ValueError:  # not on the main thread
++                armed = False
++        if isinstance(pred, str):
++            scope = dict(globals_dict or {})
++            local = {"p": p, "n": n, "r": r, "before": p, "after": n, "result": r}
++            value = eval(compile(pred, "<expect>", "eval"), scope, local)
++        elif callable(pred):
++            value = _call_with_arity(pred, p, n, r)
++        else:
++            return None, "prediction is not callable"
++    except PredicateTimeout:
++        return None, f"timed out after {timeout_seconds}s"
++    except SyntaxError as exc:
++        return None, f"SyntaxError: {exc.msg}"
++    except Exception as exc:  # noqa: BLE001 - every failure is an unknown
++        return None, _shorten(f"{exc.__class__.__name__}: {exc}", 200)
++    finally:
++        if armed:
++            signal.setitimer(signal.ITIMER_REAL, 0)
++            if previous_handler is not None:
++                signal.signal(signal.SIGALRM, previous_handler)
++    if value is None:
++        return None, "predicate returned None"
++    try:
++        return bool(value), ""
++    except Exception as exc:  # noqa: BLE001 - e.g. an ambiguous truth value
++        return None, _shorten(f"{exc.__class__.__name__}: {exc}", 200)
