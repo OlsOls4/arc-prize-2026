@@ -1,0 +1,24 @@
+Surprise-gated action batches for the ARC-AGI-3 Duck harness
+==============================================================
+
+Our own code in this directory (surprise_gate.py, surprise_predicates.py, the
+tests, scripts and docs, and the lines this patch adds) is released under MIT-0
+(see LICENSE), as the ARC Prize 2026 rules require for code we author.
+
+surprise-gate.patch modifies three files of a third-party code base. Those
+files remain under their original licences; the patch adds a modification
+notice at the top of each, as Apache-2.0 section 4(b) requires:
+
+  * ARC-AGI-3 Milestone 2 solution, Copyright Daniel Franzen
+    https://github.com/da-fr/arc-agi-3-solution - Apache License 2.0
+    (LICENSE in that repository). The patch applies on top of his harness
+    patch / repository state (upstream Duck commit 7652836 + his changes).
+  * "Duck" harness (ARC3-Inference) and TAAF framework, Copyright Jeroen
+    Cottaar / Tufa Labs - https://github.com/Tufalabs/duck-harness
+    Code: MIT; Kaggle notebook: Apache-2.0 (per the authors' statement in
+    https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion/717133;
+    the GitHub repository itself carries no LICENSE file).
+
+The public ARC-AGI-3 game files used by tests/test_public_games.py are NOT
+included; tests/fetch_public_games.py downloads them from ARC Prize with the
+toolkit's free anonymous key.
