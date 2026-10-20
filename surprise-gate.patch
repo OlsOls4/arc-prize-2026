@@ -594,7 +594,7 @@ index 0000000..f68eae7
 +    from pathlib import Path
 +
 +    levels, games = [], []
-+    for path in sorted(Path(root).rglob("surprise_gate_stats.json")):
++    for path in sorted(Path(root).rglob("*surprise_gate_stats.json")):
 +        try:
 +            data = json.loads(path.read_text(encoding="utf-8"))
 +        except (OSError, ValueError):
@@ -932,7 +932,7 @@ index 84a9cdd..e435649 100644
 +        # getattr: an agent restored from a pickle predating this field has none
 +        if getattr(self, "_surprise_stats", None) is None:
 +            self._surprise_stats = surprise_gate.SurpriseGateStats(
-+                game_id=Path(state_path).parent.name
++                game_id=Path(state_path).stem
 +            )
 +        return self._surprise_stats
 +
@@ -955,7 +955,7 @@ index 84a9cdd..e435649 100644
 +            )
 +            if raw_payload.get("level_completed") or raw_payload.get("run_complete"):
 +                log.info("%s", stats.summary_line())
-+            stats.write(Path(state_path).parent / "surprise_gate_stats.json")
++            stats.write(Path(state_path).parent / f"{Path(state_path).stem}_surprise_gate_stats.json")
 +        except Exception:  # noqa: BLE001 - diagnostics must not cost an action
 +            log.debug("surprise gate bookkeeping failed", exc_info=True)
 +
