@@ -80,7 +80,7 @@ print("RESULT " + json.dumps({k: r.get(k) for k in ("stop_reason", "executed_cou
     )
     assert "Note: SURPRISE at action 4 of 5" in prompt
     # counters on disk
-    stats = json.loads((session.state_path.parent / "surprise_gate_stats.json").read_text())
+    stats = json.loads((session.state_path.parent / f"{session.state_path.stem}_surprise_gate_stats.json").read_text())
     t = stats["totals"]
     assert t["aborts"] == 1 and t["actions_saved"] == 1 and t["actions"] == 4
     assert t["model"] == {"pass": 3, "fail": 1, "unknown": 0}
@@ -213,7 +213,7 @@ def test_gate_off_is_baseline(monkeypatch, tmp_path):
     out, _ = run_snippet(agent, session, 'action(["RIGHT"], expect=lambda p, n: True)')
     assert "unexpected keyword argument 'expect'" in json.loads(out)["error"]
     assert agent._surprise_stats is None
-    assert not (session.state_path.parent / "surprise_gate_stats.json").exists()
+    assert not (session.state_path.parent / f"{session.state_path.stem}_surprise_gate_stats.json").exists()
     prompt_off = tool_agent._build_system_prompt(tool_output_tokens=3072)
     monkeypatch.setenv("ARC3_SURPRISE_GATE", "1")
     prompt_on = tool_agent._build_system_prompt(tool_output_tokens=3072)
