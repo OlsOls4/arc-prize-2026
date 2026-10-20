@@ -61,7 +61,7 @@ All flags are read at call time.
 
 ## Counters
 
-Each game run directory gets a `surprise_gate_stats.json`, rewritten after every `action(...)` call. It is kept per level and holds:
+Each game run gets a `<run>_surprise_gate_stats.json` in the artifacts directory, rewritten after every `action(...)` call. It is kept per level and holds:
 
 - `actions`, `requested`, `batches`, `predicted`
 - `model` and `default` verdict counts (pass, fail, unknown) and their rates
