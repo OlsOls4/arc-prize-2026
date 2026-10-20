@@ -61,5 +61,5 @@ def test_full_loop_with_fake_llm(monkeypatch, tmp_path):
     assert t["aborts"] == 1 and t["actions_saved"] == 1
     assert t["model"] == {"pass": 3, "fail": 1, "unknown": 0}
     assert t["actions"] == 8
-    stats = json.loads((session.state_path.parent / "surprise_gate_stats.json").read_text())
+    stats = json.loads((session.state_path.parent / f"{session.state_path.stem}_surprise_gate_stats.json").read_text())
     assert stats["totals"]["actions"] == 8
