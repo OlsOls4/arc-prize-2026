@@ -313,7 +313,7 @@ def summarize_run_dir(root: Any) -> dict[str, Any]:
     from pathlib import Path
 
     levels, games = [], []
-    for path in sorted(Path(root).rglob("surprise_gate_stats.json")):
+    for path in sorted(Path(root).rglob("*surprise_gate_stats.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
